@@ -18,6 +18,9 @@ function resolveHostEditPath(root: string, pathParam: string): string {
  * the file may be correctly updated but the tool reports failure. This wrapper catches errors and
  * if the target file on disk contains the intended newText, returns success so we don't surface
  * a false "edit failed" to the user (fixes #32333, same pattern as #30773 for write).
+ *
+ * Also handles the case where the upstream edit tool returns isError=true without throwing,
+ * but the file has actually been modified correctly (fixes #49363).
  */
 export function wrapHostEditToolWithPostWriteRecovery(
   base: AnyAgentTool,
@@ -31,27 +34,30 @@ export function wrapHostEditToolWithPostWriteRecovery(
       signal: AbortSignal | undefined,
       onUpdate?: AgentToolUpdateCallback<unknown>,
     ) => {
-      try {
-        return await base.execute(toolCallId, params, signal, onUpdate);
-      } catch (err) {
-        const record =
-          params && typeof params === "object" ? (params as Record<string, unknown>) : undefined;
-        const pathParam = record && typeof record.path === "string" ? record.path : undefined;
-        const newText =
-          record && typeof record.newText === "string"
-            ? record.newText
-            : record && typeof record.new_string === "string"
-              ? record.new_string
-              : undefined;
-        const oldText =
-          record && typeof record.oldText === "string"
-            ? record.oldText
-            : record && typeof record.old_string === "string"
-              ? record.old_string
-              : undefined;
-        if (!pathParam || !newText) {
-          throw err;
-        }
+      // Extract params once so both the isError check and the catch block can use them.
+      const record =
+        params && typeof params === "object" ? (params as Record<string, unknown>) : undefined;
+      const pathParam = record && typeof record.path === "string" ? record.path : undefined;
+      const newText =
+        record && typeof record.newText === "string"
+          ? record.newText
+          : record && typeof record.new_string === "string"
+            ? record.new_string
+            : undefined;
+      const oldText =
+        record && typeof record.oldText === "string"
+          ? record.oldText
+          : record && typeof record.old_string === "string"
+            ? record.old_string
+            : undefined;
+
+      /**
+       * Attempt post-write recovery: if the file on disk contains newText and no longer
+       * contains oldText, the edit succeeded and we return a synthetic success result.
+       * Returns undefined when recovery is not applicable.
+       */
+      async function tryRecover(): Promise<AgentToolResult<unknown> | undefined> {
+        if (!pathParam || !newText) return undefined;
         try {
           const absolutePath = resolveHostEditPath(root, pathParam);
           const content = await fs.readFile(absolutePath, "utf-8");
@@ -73,7 +79,32 @@ export function wrapHostEditToolWithPostWriteRecovery(
             } as AgentToolResult<unknown>;
           }
         } catch {
-          // File read failed or path invalid; rethrow original error.
+          // File read failed or path invalid; recovery not possible.
+        }
+        return undefined;
+      }
+
+      try {
+        const result = await base.execute(toolCallId, params, signal, onUpdate);
+
+        // NEW (#49363): Handle false-positive failures — base tool returned isError=true
+        // without throwing, but the file was actually modified correctly.
+        if (
+          result != null &&
+          typeof result === "object" &&
+          (result as Record<string, unknown>).isError === true
+        ) {
+          const recovered = await tryRecover();
+          if (recovered !== undefined) {
+            return recovered;
+          }
+        }
+
+        return result;
+      } catch (err) {
+        const recovered = await tryRecover();
+        if (recovered !== undefined) {
+          return recovered;
         }
         throw err;
       }
